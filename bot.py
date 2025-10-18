@@ -31,15 +31,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv()
 
 # --- Configuration ---
-API_ID = int(os.environ.get("API_ID", "123456"))
-API_HASH = os.environ.get("API_HASH", "your_api_hash")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
-MONGO_URI = os.environ.get("MONGO_URI", "your_mongo_uri")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1003030414300")) 
-UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL", "your_channel") 
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGO_URI")
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL")) 
+UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL") 
 
 # Admin configuration
-ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS_STR = os.environ.get("ADMIN_IDS")
 ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip()]
 
 # --- Database Setup ---
