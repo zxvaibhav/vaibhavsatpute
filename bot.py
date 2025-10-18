@@ -34,7 +34,7 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL")) 
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1003030414300")) 
 UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL") 
 
 # Admin configuration
@@ -130,14 +130,18 @@ def get_file_name(message: Message):
 
 async def forward_to_log_channel(client: Client, message: Message):
     try:
-        await client.get_chat(LOG_CHANNEL)
-    except (ChannelInvalid, ChannelPrivate) as e:
-        logging.error(f"Bot doesn't have access to log channel {LOG_CHANNEL}: {e}")
-        return None
-    
-    try:
+        # Check if bot has access to log channel
+        try:
+            await client.get_chat(LOG_CHANNEL)
+        except (ChannelInvalid, ChannelPrivate) as e:
+            logging.error(f"Bot doesn't have access to log channel: {e}")
+            return None
+        
+        # Forward the message
         forwarded_message = await message.forward(LOG_CHANNEL)
+        logging.info(f"Successfully forwarded message. Message ID: {forwarded_message.id}")
         return forwarded_message
+        
     except Exception as e:
         logging.error(f"Error forwarding to log channel: {e}")
         return None
@@ -194,9 +198,13 @@ async def start_handler(client: Client, message: Message):
                     except Exception as e:
                         logging.error(f"Error sending file: {e}")
                 
-                await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
+                # Only show success message if files were actually sent
+                if success_count > 0:
+                    await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
+                else:
+                    await status_msg.delete()  # Delete the message if no files were sent
             else:
-                await message.reply("🤔 Files not found!")
+                await message.reply("🤔 Files not found! The link might be wrong or expired.")
         else:
             file_record = files_collection.find_one({"_id": file_id_str})
             if file_record:
@@ -209,7 +217,7 @@ async def start_handler(client: Client, message: Message):
                 except Exception as e:
                     await message.reply(f"❌ Error sending file.\n`Error: {e}`")
             else:
-                await message.reply("🤔 File not found!")
+                await message.reply("🤔 File not found! The link might be wrong or expired.")
     else:
         help_text = """
 **📁 File Store Bot**
@@ -249,7 +257,9 @@ async def file_handler(client: Client, message: Message):
         forwarded_message = await forward_to_log_channel(client, message)
         
         if not forwarded_message:
-            await processing_msg.edit_text("❌ **Error!** Failed to process file.")
+            await processing_msg.edit_text("❌ **Error!** Failed to process file. Please try again.")
+            # Remove processing flag
+            user_processing[user_id]['processing'] = False
             return
         
         # Generate file ID and save to database
@@ -275,24 +285,29 @@ async def file_handler(client: Client, message: Message):
         cancel_button = InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")
         keyboard = InlineKeyboardMarkup([[get_link_button], [add_more_button], [cancel_button]])
         
-        # Update processing message to show menu - ONLY ONE MESSAGE
-        await processing_msg.edit_text(
+        # Delete processing message first
+        await processing_msg.delete()
+        
+        # Send final menu - ONLY ONE MESSAGE
+        menu_msg = await message.reply(
             f"✅ **File added successfully!**\n\n"
             f"📊 **Total Files:** {file_count}\n\n"
             f"**Choose an option:**",
-            reply_markup=keyboard
+            reply_markup=keyboard,
+            quote=True
         )
+        
+        # Store menu message reference
+        user_processing[user_id]['menu_message'] = menu_msg
         
     except Exception as e:
         logging.error(f"File handling error: {e}")
         try:
-            await message.reply(f"❌ **Error!**\n\nSomething went wrong.\n`Details: {e}`")
+            # Remove processing flag on error
+            user_processing[user_id]['processing'] = False
+            await message.reply("❌ **Error!** Failed to process file. Please try again.")
         except:
             pass
-    finally:
-        # Always remove processing flag
-        if user_id in user_processing:
-            user_processing[user_id]['processing'] = False
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
 async def get_batch_link_callback(client: Client, callback_query: CallbackQuery):
@@ -328,21 +343,21 @@ async def get_batch_link_callback(client: Client, callback_query: CallbackQuery)
 @app.on_callback_query(filters.regex(r"^add_more_files$"))
 async def add_more_files_callback(client: Client, callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
-    batch = batches_collection.find_one({"user_id": user_id, "status": "active"})
     
-    if batch:
-        file_count = len(batch.get("file_ids", []))
-        await callback_query.message.edit_text(
-            f"✅ **Ready for more files!**\n\n"
-            f"📊 **Current:** {file_count} files\n\n"
-            f"**Send more files now.**",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Get Link Now", callback_data="get_batch_link")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")]
-            ])
-        )
-    else:
-        await callback_query.answer("No active batch!", show_alert=True)
+    # Update the message to show ready for more files
+    await callback_query.message.edit_text(
+        "✅ **Ready for more files!**\n\n"
+        "**Send your files now.**\n"
+        "All files will be added to the same batch.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 Get Link Now", callback_data="get_batch_link")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")]
+        ])
+    )
+    
+    # Ensure processing flag is reset so new files can be processed
+    if user_id in user_processing:
+        user_processing[user_id]['processing'] = False
 
 @app.on_callback_query(filters.regex(r"^cancel_batch$"))
 async def cancel_batch_callback(client: Client, callback_query: CallbackQuery):
@@ -361,7 +376,22 @@ async def cancel_batch_callback(client: Client, callback_query: CallbackQuery):
     if user_id in user_processing:
         del user_processing[user_id]
 
-# Other handlers (settings, help, etc) remain the same...
+@app.on_message(filters.command("help") & filters.private)
+async def help_handler(client: Client, message: Message):
+    help_text = """
+**📁 File Store Bot**
+
+**How to use me:**
+1. Send me any file
+2. Wait for processing
+3. Get your link
+
+**Commands:**
+/start - Restart bot
+/help - Show help
+    """
+    await message.reply(help_text)
+
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_handler(client: Client, message: Message):
     if message.from_user.id not in ADMINS:
@@ -415,7 +445,7 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
             file_records = get_batch_files(batch_id)
             
             if file_records:
-                await callback_query.message.edit_text(f"📦 **Sending {len(file_records)} files...**")
+                status_msg = await callback_query.message.edit_text(f"📦 **Sending {len(file_records)} files...**")
                 success_count = 0
                 
                 for file_record in file_records:
@@ -429,7 +459,11 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
                     except Exception as e:
                         logging.error(f"Error sending file: {e}")
                 
-                await callback_query.message.edit_text(f"✅ **{success_count} files sent!**")
+                # Only show success if files were sent
+                if success_count > 0:
+                    await status_msg.edit_text(f"✅ **{success_count} files sent!**")
+                else:
+                    await status_msg.delete()
             else:
                 await callback_query.message.edit_text("🤔 Files not found!")
         else:
@@ -443,7 +477,7 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
                     )
                     await callback_query.message.delete()
                 except Exception as e:
-                    await callback_query.message.edit_text(f"❌ Error: {e}")
+                    await callback_query.message.edit_text("❌ Error sending file.")
             else:
                 await callback_query.message.edit_text("🤔 File not found!")
     else:
