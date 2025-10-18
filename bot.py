@@ -132,6 +132,9 @@ def get_file_name(message: Message):
     else:
         return "File"
 
+# Store active processing messages to update them
+user_status_messages = {}
+
 # --- Bot Command Handlers ---
 
 @app.on_message(filters.command("start") & filters.private)
@@ -141,6 +144,10 @@ async def start_handler(client: Client, message: Message):
         {"user_id": message.from_user.id, "status": "active"},
         {"$set": {"status": "cancelled"}}
     )
+    
+    # Clear user status message
+    if message.from_user.id in user_status_messages:
+        del user_status_messages[message.from_user.id]
     
     if len(message.command) > 1:
         file_id_str = message.command[1]
@@ -162,7 +169,7 @@ async def start_handler(client: Client, message: Message):
             file_records = get_batch_files(batch_id)
             
             if file_records:
-                await message.reply(f"📦 **Sending {len(file_records)} files...**")
+                status_msg = await message.reply(f"📦 **Sending {len(file_records)} files...**")
                 success_count = 0
                 
                 for file_record in file_records:
@@ -176,10 +183,7 @@ async def start_handler(client: Client, message: Message):
                     except Exception as e:
                         logging.error(f"Error sending file: {e}")
                 
-                if success_count > 0:
-                    await message.reply(f"✅ **{success_count} files sent successfully!**")
-                else:
-                    await message.reply("❌ Could not send any files. Files may have expired.")
+                await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
             else:
                 await message.reply("🤔 Files not found! The link might be wrong or expired.")
         else:
@@ -242,12 +246,24 @@ async def file_handler(client: Client, message: Message):
         await message.reply("😔 **Sorry!** Only admins can upload files in private mode.")
         return
 
-    # Delete any previous processing messages to keep chat clean
-    await message.delete()
-    
-    status_msg = await message.reply("⏳ Processing your file...", quote=True)
+    user_id = message.from_user.id
     
     try:
+        # Check if we already have a status message for this user
+        if user_id in user_status_messages:
+            try:
+                # Update existing status message instead of creating new one
+                status_msg = user_status_messages[user_id]
+                await status_msg.edit_text("⏳ Processing your file...")
+            except:
+                # If old message is gone, create new one
+                status_msg = await message.reply("⏳ Processing your file...", quote=True)
+                user_status_messages[user_id] = status_msg
+        else:
+            # Create new status message
+            status_msg = await message.reply("⏳ Processing your file...", quote=True)
+            user_status_messages[user_id] = status_msg
+
         # Forward file to log channel
         forwarded_message = await message.forward(LOG_CHANNEL)
         
@@ -262,7 +278,7 @@ async def file_handler(client: Client, message: Message):
             'file_name': get_file_name(message),
             'added_at': datetime.now()
         }
-        batch_id = add_file_to_batch(message.from_user.id, file_data)
+        batch_id = add_file_to_batch(user_id, file_data)
         
         # Get updated batch info
         batch = batches_collection.find_one({"batch_id": batch_id})
@@ -283,7 +299,8 @@ async def file_handler(client: Client, message: Message):
         
     except Exception as e:
         logging.error(f"File handling error: {e}")
-        await status_msg.edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+        if user_id in user_status_messages:
+            await user_status_messages[user_id].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
 async def get_batch_link_callback(client: Client, callback_query: CallbackQuery):
@@ -311,6 +328,10 @@ async def get_batch_link_callback(client: Client, callback_query: CallbackQuery)
             [InlineKeyboardButton("🔗 Share Link", url=f"https://t.me/share/url?url={share_link}")]
         ])
     )
+    
+    # Clear user status message after getting link
+    if user_id in user_status_messages:
+        del user_status_messages[user_id]
 
 @app.on_callback_query(filters.regex(r"^add_more_files$"))
 async def add_more_files_callback(client: Client, callback_query: CallbackQuery):
@@ -323,7 +344,7 @@ async def add_more_files_callback(client: Client, callback_query: CallbackQuery)
             f"✅ **Ready for more files!**\n\n"
             f"📊 **Current Batch:** {file_count} file(s)\n\n"
             f"**You can now send more files.**\n"
-            f"After each file, the menu will update automatically.",
+            f"After each file, this menu will update automatically.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔗 Get Link Now", callback_data="get_batch_link")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")]
@@ -344,6 +365,10 @@ async def cancel_batch_callback(client: Client, callback_query: CallbackQuery):
         "❌ **Batch cancelled!**\n\n"
         "You can start a new batch by sending files."
     )
+    
+    # Clear user status message after cancellation
+    if user_id in user_status_messages:
+        del user_status_messages[user_id]
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_handler(client: Client, message: Message):
@@ -420,10 +445,7 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
                     except Exception as e:
                         logging.error(f"Error sending file: {e}")
                 
-                if success_count > 0:
-                    await callback_query.message.edit_text(f"✅ **{success_count} files sent successfully!**")
-                else:
-                    await callback_query.message.edit_text("❌ Could not send any files.")
+                await callback_query.message.edit_text(f"✅ **{success_count} files sent successfully!**")
             else:
                 await callback_query.message.edit_text("🤔 Files not found!")
         else:
