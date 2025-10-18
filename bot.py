@@ -2,7 +2,6 @@ import os
 import logging
 import random
 import string
-import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
@@ -202,9 +201,9 @@ async def start_handler(client: Client, message: Message):
                 if success_count > 0:
                     await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
                 else:
-                    await status_msg.delete()  # Delete the message if no files were sent
+                    await status_msg.delete()
             else:
-                await message.reply("🤔 Files not found! The link might be wrong or expired.")
+                await message.reply("🤔 Files not found!")
         else:
             file_record = files_collection.find_one({"_id": file_id_str})
             if file_record:
@@ -215,16 +214,16 @@ async def start_handler(client: Client, message: Message):
                         message_id=file_record['message_id']
                     )
                 except Exception as e:
-                    await message.reply(f"❌ Error sending file.\n`Error: {e}`")
+                    await message.reply(f"❌ Error sending file.")
             else:
-                await message.reply("🤔 File not found! The link might be wrong or expired.")
+                await message.reply("🤔 File not found!")
     else:
         help_text = """
 **📁 File Store Bot**
 
 **How to use me:**
 1. Send me any file
-2. Wait for processing
+2. Wait for processing  
 3. Get your link
 
 **Commands:**
@@ -249,10 +248,10 @@ async def file_handler(client: Client, message: Message):
     # Mark user as being processed
     user_processing[user_id] = {'processing': True, 'last_file': datetime.now()}
     
+    # Show processing message
+    processing_msg = await message.reply("⏳ **Processing your file...**", quote=True)
+    
     try:
-        # Show processing message
-        processing_msg = await message.reply("⏳ **Processing your file...**", quote=True)
-        
         # Forward file to log channel
         forwarded_message = await forward_to_log_channel(client, message)
         
@@ -303,11 +302,13 @@ async def file_handler(client: Client, message: Message):
     except Exception as e:
         logging.error(f"File handling error: {e}")
         try:
-            # Remove processing flag on error
-            user_processing[user_id]['processing'] = False
-            await message.reply("❌ **Error!** Failed to process file. Please try again.")
+            await processing_msg.edit_text("❌ **Error!** Failed to process file. Please try again.")
         except:
             pass
+    finally:
+        # Always remove processing flag
+        if user_id in user_processing:
+            user_processing[user_id]['processing'] = False
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
 async def get_batch_link_callback(client: Client, callback_query: CallbackQuery):
@@ -483,25 +484,6 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
     else:
         await callback_query.answer("Join channel first!", show_alert=True)
 
-# Cleanup old processing states
-async def cleanup_processing():
-    while True:
-        try:
-            current_time = datetime.now()
-            users_to_remove = []
-            
-            for user_id, state in user_processing.items():
-                if (current_time - state['last_file']).total_seconds() > 300:  # 5 minutes
-                    users_to_remove.append(user_id)
-            
-            for user_id in users_to_remove:
-                del user_processing[user_id]
-                
-        except Exception as e:
-            logging.error(f"Cleanup error: {e}")
-        
-        await asyncio.sleep(60)
-
 # --- Start the Bot ---
 if __name__ == "__main__":
     if not ADMINS:
@@ -511,9 +493,6 @@ if __name__ == "__main__":
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    
-    # Start cleanup task
-    asyncio.get_event_loop().create_task(cleanup_processing())
     
     logging.info("Bot starting...")
     app.run()
