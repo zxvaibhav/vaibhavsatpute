@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
-from pyrogram.errors import UserNotParticipant
+from pyrogram.errors import UserNotParticipant, MessageIdInvalid, ChannelInvalid, ChannelPrivate
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from pymongo import MongoClient
 from flask import Flask
@@ -133,6 +133,28 @@ def get_file_name(message: Message):
     else:
         return "File"
 
+async def forward_to_log_channel(client: Client, message: Message):
+    """Safely forward message to log channel with error handling"""
+    try:
+        # Check if bot has access to log channel
+        try:
+            await client.get_chat(LOG_CHANNEL)
+        except (ChannelInvalid, ChannelPrivate) as e:
+            logging.error(f"Bot doesn't have access to log channel {LOG_CHANNEL}: {e}")
+            return None
+        
+        # Forward the message
+        forwarded_message = await message.forward(LOG_CHANNEL)
+        logging.info(f"Successfully forwarded message to log channel. Message ID: {forwarded_message.id}")
+        return forwarded_message
+        
+    except MessageIdInvalid as e:
+        logging.error(f"MessageIdInvalid while forwarding: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Error forwarding to log channel: {e}")
+        return None
+
 # Store user processing states
 user_processing_states = {}
 
@@ -173,6 +195,7 @@ async def start_handler(client: Client, message: Message):
             if file_records:
                 status_msg = await message.reply(f"📦 **Sending {len(file_records)} files...**")
                 success_count = 0
+                failed_count = 0
                 
                 for file_record in file_records:
                     try:
@@ -184,8 +207,12 @@ async def start_handler(client: Client, message: Message):
                         success_count += 1
                     except Exception as e:
                         logging.error(f"Error sending file: {e}")
+                        failed_count += 1
                 
-                await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
+                if success_count > 0:
+                    await status_msg.edit_text(f"✅ **{success_count} files sent successfully!**")
+                else:
+                    await status_msg.edit_text("❌ Could not send any files. Files may have expired.")
             else:
                 await message.reply("🤔 Files not found! The link might be wrong or expired.")
         else:
@@ -260,54 +287,68 @@ async def file_handler(client: Client, message: Message):
             'processing': False,
             'files_received': 0,
             'status_message': None,
-            'last_activity': datetime.now()
+            'last_activity': datetime.now(),
+            'pending_files': []
         }
     
     user_state = user_processing_states[user_id]
     user_state['files_received'] += 1
     user_state['last_activity'] = datetime.now()
+    user_state['pending_files'].append(message)
     
     try:
         # If not currently processing, start processing with a delay
         if not user_state['processing']:
             user_state['processing'] = True
             
-            # Wait for 3 seconds to collect multiple files
-            await asyncio.sleep(3)
+            # Wait for 2 seconds to collect multiple files
+            await asyncio.sleep(2)
             
-            # Check if any new files were received during the wait
-            current_files_count = user_state['files_received']
+            # Get all pending files
+            pending_files = user_state['pending_files'].copy()
+            user_state['pending_files'] = []
             
             # Create or update status message
             if not user_state['status_message']:
-                user_state['status_message'] = await message.reply(f"⏳ Processing {current_files_count} file(s)...", quote=True)
+                user_state['status_message'] = await message.reply(f"⏳ Processing {len(pending_files)} file(s)...", quote=True)
             else:
-                await user_state['status_message'].edit_text(f"⏳ Processing {current_files_count} file(s)...")
+                await user_state['status_message'].edit_text(f"⏳ Processing {len(pending_files)} file(s)...")
             
             # Process all received files
             processed_count = 0
+            failed_count = 0
             batch = get_user_batch(user_id)
             
-            # Forward file to log channel and add to batch
-            forwarded_message = await message.forward(LOG_CHANNEL)
-            
-            # Generate file ID and save to database
-            file_id_str = generate_random_string()
-            files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
-            
-            # Add file to user's batch
-            file_data = {
-                'file_id': file_id_str,
-                'message_id': forwarded_message.id,
-                'file_name': get_file_name(message),
-                'added_at': datetime.now()
-            }
-            batch_id = add_file_to_batch(user_id, file_data)
-            processed_count += 1
+            for file_message in pending_files:
+                try:
+                    # Forward file to log channel with error handling
+                    forwarded_message = await forward_to_log_channel(client, file_message)
+                    
+                    if forwarded_message:
+                        # Generate file ID and save to database
+                        file_id_str = generate_random_string()
+                        files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+                        
+                        # Add file to user's batch
+                        file_data = {
+                            'file_id': file_id_str,
+                            'message_id': forwarded_message.id,
+                            'file_name': get_file_name(file_message),
+                            'added_at': datetime.now()
+                        }
+                        batch_id = add_file_to_batch(user_id, file_data)
+                        processed_count += 1
+                    else:
+                        failed_count += 1
+                        logging.error(f"Failed to forward file for user {user_id}")
+                        
+                except Exception as e:
+                    failed_count += 1
+                    logging.error(f"Error processing file: {e}")
             
             # Get updated batch info
             batch = batches_collection.find_one({"batch_id": batch_id})
-            file_count = len(batch.get("file_ids", []))
+            file_count = len(batch.get("file_ids", [])) if batch else 0
             
             # Create clean menu buttons
             get_link_button = InlineKeyboardButton(f"🔗 Get Link ({file_count} files)", callback_data="get_batch_link")
@@ -316,8 +357,12 @@ async def file_handler(client: Client, message: Message):
             keyboard = InlineKeyboardMarkup([[get_link_button], [add_more_button], [cancel_button]])
             
             # Show final menu
+            result_text = f"✅ **{processed_count} file(s) processed successfully!**"
+            if failed_count > 0:
+                result_text += f"\n❌ **{failed_count} file(s) failed to process**"
+            
             await user_state['status_message'].edit_text(
-                f"✅ **{processed_count} file(s) processed successfully!**\n\n"
+                f"{result_text}\n\n"
                 f"📊 **Total in Batch:** {file_count} file(s)\n\n"
                 f"**Choose an option:**",
                 reply_markup=keyboard
@@ -333,11 +378,12 @@ async def file_handler(client: Client, message: Message):
         
     except Exception as e:
         logging.error(f"File handling error: {e}")
-        if user_state['status_message']:
+        if user_state.get('status_message'):
             await user_state['status_message'].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
         # Reset state on error
         user_state['processing'] = False
         user_state['files_received'] = 0
+        user_state['pending_files'] = []
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
 async def get_batch_link_callback(client: Client, callback_query: CallbackQuery):
