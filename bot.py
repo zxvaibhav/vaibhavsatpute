@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import string
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from pyrogram import Client, filters, enums
@@ -132,8 +133,8 @@ def get_file_name(message: Message):
     else:
         return "File"
 
-# Store active processing messages to update them
-user_status_messages = {}
+# Store user processing states
+user_processing_states = {}
 
 # --- Bot Command Handlers ---
 
@@ -145,9 +146,10 @@ async def start_handler(client: Client, message: Message):
         {"$set": {"status": "cancelled"}}
     )
     
-    # Clear user status message
-    if message.from_user.id in user_status_messages:
-        del user_status_messages[message.from_user.id]
+    # Clear user processing state
+    user_id = message.from_user.id
+    if user_id in user_processing_states:
+        del user_processing_states[user_id]
     
     if len(message.command) > 1:
         file_id_str = message.command[1]
@@ -208,10 +210,12 @@ async def start_handler(client: Client, message: Message):
 
 1. **Send Files**: Send me any file, or forward multiple files.
 
-2. **Use the Menu**: After sending files, a menu will appear:
-   - 🔗 **Get Link**: Creates a permanent link for all files in your batch.
-   - ➕ **Add More Files**: Add more files to the current batch.
-   - ❌ **Cancel**: Cancel the current batch.
+2. **Wait for Processing**: All files will be processed first, then you'll get a menu.
+
+3. **Use the Menu**: After processing, choose:
+   - 🔗 **Get Link**: Creates a permanent link for all files
+   - ➕ **Add More Files**: Add more files to current batch
+   - ❌ **Cancel**: Cancel the current batch
 
 **Available Commands:**
 /start - Restart the bot and clear session
@@ -228,10 +232,12 @@ async def help_handler(client: Client, message: Message):
 
 1. **Send Files**: Send me any file, or forward multiple files.
 
-2. **Use the Menu**: After sending files, a menu will appear:
-   - 🔗 **Get Link**: Creates a permanent link for all files in your batch.
-   - ➕ **Add More Files**: Add more files to the current batch.
-   - ❌ **Cancel**: Cancel the current batch.
+2. **Wait for Processing**: All files will be processed first, then you'll get a menu.
+
+3. **Use the Menu**: After processing, choose:
+   - 🔗 **Get Link**: Creates a permanent link for all files
+   - ➕ **Add More Files**: Add more files to current batch
+   - ❌ **Cancel**: Cancel the current batch
 
 **Available Commands:**
 /start - Restart the bot and clear session
@@ -248,59 +254,90 @@ async def file_handler(client: Client, message: Message):
 
     user_id = message.from_user.id
     
-    try:
-        # Check if we already have a status message for this user
-        if user_id in user_status_messages:
-            try:
-                # Update existing status message instead of creating new one
-                status_msg = user_status_messages[user_id]
-                await status_msg.edit_text("⏳ Processing your file...")
-            except:
-                # If old message is gone, create new one
-                status_msg = await message.reply("⏳ Processing your file...", quote=True)
-                user_status_messages[user_id] = status_msg
-        else:
-            # Create new status message
-            status_msg = await message.reply("⏳ Processing your file...", quote=True)
-            user_status_messages[user_id] = status_msg
-
-        # Forward file to log channel
-        forwarded_message = await message.forward(LOG_CHANNEL)
-        
-        # Generate file ID and save to database
-        file_id_str = generate_random_string()
-        files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
-        
-        # Add file to user's batch
-        file_data = {
-            'file_id': file_id_str,
-            'message_id': forwarded_message.id,
-            'file_name': get_file_name(message),
-            'added_at': datetime.now()
+    # Initialize user processing state if not exists
+    if user_id not in user_processing_states:
+        user_processing_states[user_id] = {
+            'processing': False,
+            'files_received': 0,
+            'status_message': None,
+            'last_activity': datetime.now()
         }
-        batch_id = add_file_to_batch(user_id, file_data)
-        
-        # Get updated batch info
-        batch = batches_collection.find_one({"batch_id": batch_id})
-        file_count = len(batch.get("file_ids", []))
-        
-        # Create clean menu buttons
-        get_link_button = InlineKeyboardButton(f"🔗 Get Link ({file_count} files)", callback_data="get_batch_link")
-        add_more_button = InlineKeyboardButton("➕ Add More Files", callback_data="add_more_files")
-        cancel_button = InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")
-        keyboard = InlineKeyboardMarkup([[get_link_button], [add_more_button], [cancel_button]])
-        
-        await status_msg.edit_text(
-            f"✅ **File added successfully!**\n\n"
-            f"📊 **Current Batch:** {file_count} file(s)\n\n"
-            f"**Choose an option:**",
-            reply_markup=keyboard
-        )
+    
+    user_state = user_processing_states[user_id]
+    user_state['files_received'] += 1
+    user_state['last_activity'] = datetime.now()
+    
+    try:
+        # If not currently processing, start processing with a delay
+        if not user_state['processing']:
+            user_state['processing'] = True
+            
+            # Wait for 3 seconds to collect multiple files
+            await asyncio.sleep(3)
+            
+            # Check if any new files were received during the wait
+            current_files_count = user_state['files_received']
+            
+            # Create or update status message
+            if not user_state['status_message']:
+                user_state['status_message'] = await message.reply(f"⏳ Processing {current_files_count} file(s)...", quote=True)
+            else:
+                await user_state['status_message'].edit_text(f"⏳ Processing {current_files_count} file(s)...")
+            
+            # Process all received files
+            processed_count = 0
+            batch = get_user_batch(user_id)
+            
+            # Forward file to log channel and add to batch
+            forwarded_message = await message.forward(LOG_CHANNEL)
+            
+            # Generate file ID and save to database
+            file_id_str = generate_random_string()
+            files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+            
+            # Add file to user's batch
+            file_data = {
+                'file_id': file_id_str,
+                'message_id': forwarded_message.id,
+                'file_name': get_file_name(message),
+                'added_at': datetime.now()
+            }
+            batch_id = add_file_to_batch(user_id, file_data)
+            processed_count += 1
+            
+            # Get updated batch info
+            batch = batches_collection.find_one({"batch_id": batch_id})
+            file_count = len(batch.get("file_ids", []))
+            
+            # Create clean menu buttons
+            get_link_button = InlineKeyboardButton(f"🔗 Get Link ({file_count} files)", callback_data="get_batch_link")
+            add_more_button = InlineKeyboardButton("➕ Add More Files", callback_data="add_more_files")
+            cancel_button = InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")
+            keyboard = InlineKeyboardMarkup([[get_link_button], [add_more_button], [cancel_button]])
+            
+            # Show final menu
+            await user_state['status_message'].edit_text(
+                f"✅ **{processed_count} file(s) processed successfully!**\n\n"
+                f"📊 **Total in Batch:** {file_count} file(s)\n\n"
+                f"**Choose an option:**",
+                reply_markup=keyboard
+            )
+            
+            # Reset processing state
+            user_state['processing'] = False
+            user_state['files_received'] = 0
+            
+        else:
+            # If already processing, just update the count
+            user_state['files_received'] += 1
         
     except Exception as e:
         logging.error(f"File handling error: {e}")
-        if user_id in user_status_messages:
-            await user_status_messages[user_id].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+        if user_state['status_message']:
+            await user_state['status_message'].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+        # Reset state on error
+        user_state['processing'] = False
+        user_state['files_received'] = 0
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
 async def get_batch_link_callback(client: Client, callback_query: CallbackQuery):
@@ -329,9 +366,9 @@ async def get_batch_link_callback(client: Client, callback_query: CallbackQuery)
         ])
     )
     
-    # Clear user status message after getting link
-    if user_id in user_status_messages:
-        del user_status_messages[user_id]
+    # Clear user processing state after getting link
+    if user_id in user_processing_states:
+        del user_processing_states[user_id]
 
 @app.on_callback_query(filters.regex(r"^add_more_files$"))
 async def add_more_files_callback(client: Client, callback_query: CallbackQuery):
@@ -344,7 +381,7 @@ async def add_more_files_callback(client: Client, callback_query: CallbackQuery)
             f"✅ **Ready for more files!**\n\n"
             f"📊 **Current Batch:** {file_count} file(s)\n\n"
             f"**You can now send more files.**\n"
-            f"After each file, this menu will update automatically.",
+            f"Files will be processed together after a short delay.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔗 Get Link Now", callback_data="get_batch_link")],
                 [InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")]
@@ -366,9 +403,9 @@ async def cancel_batch_callback(client: Client, callback_query: CallbackQuery):
         "You can start a new batch by sending files."
     )
     
-    # Clear user status message after cancellation
-    if user_id in user_status_messages:
-        del user_status_messages[user_id]
+    # Clear user processing state after cancellation
+    if user_id in user_processing_states:
+        del user_processing_states[user_id]
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_handler(client: Client, message: Message):
@@ -465,6 +502,27 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
     else:
         await callback_query.answer("You haven't joined the channel yet. Please join and try again.", show_alert=True)
 
+# Cleanup function to remove old processing states
+async def cleanup_processing_states():
+    while True:
+        try:
+            current_time = datetime.now()
+            users_to_remove = []
+            
+            for user_id, state in user_processing_states.items():
+                # Remove states older than 10 minutes
+                if (current_time - state['last_activity']).total_seconds() > 600:
+                    users_to_remove.append(user_id)
+            
+            for user_id in users_to_remove:
+                del user_processing_states[user_id]
+                logging.info(f"Cleaned up processing state for user {user_id}")
+                
+        except Exception as e:
+            logging.error(f"Error in cleanup_processing_states: {e}")
+        
+        await asyncio.sleep(300)  # Run every 5 minutes
+
 # --- Start the Bot ---
 if __name__ == "__main__":
     if not ADMINS:
@@ -475,6 +533,9 @@ if __name__ == "__main__":
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
+    
+    # Start cleanup task
+    asyncio.get_event_loop().create_task(cleanup_processing_states())
     
     logging.info("Bot is starting...")
     app.run()
