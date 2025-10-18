@@ -231,7 +231,7 @@ async def start_handler(client: Client, message: Message):
                 await message.reply("🤔 File not found! The link might be wrong or expired.")
     else:
         help_text = """
-**📁 Multi-File Link Bot**
+**📁 File Store Bot**
 
 **How to use me:**
 
@@ -253,7 +253,7 @@ async def start_handler(client: Client, message: Message):
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client: Client, message: Message):
     help_text = """
-**📁 Multi-File Link Bot**
+**📁 File Store Bot**
 
 **How to use me:**
 
@@ -292,8 +292,9 @@ async def file_handler(client: Client, message: Message):
         }
     
     user_state = user_processing_states[user_id]
-    user_state['files_received'] += 1
     user_state['last_activity'] = datetime.now()
+    
+    # Add file to pending list
     user_state['pending_files'].append(message)
     
     try:
@@ -306,13 +307,17 @@ async def file_handler(client: Client, message: Message):
             
             # Get all pending files
             pending_files = user_state['pending_files'].copy()
-            user_state['pending_files'] = []
+            total_files = len(pending_files)
             
-            # Create or update status message
-            if not user_state['status_message']:
-                user_state['status_message'] = await message.reply(f"⏳ Processing {len(pending_files)} file(s)...", quote=True)
-            else:
-                await user_state['status_message'].edit_text(f"⏳ Processing {len(pending_files)} file(s)...")
+            # Delete old status message if exists
+            if user_state['status_message']:
+                try:
+                    await user_state['status_message'].delete()
+                except:
+                    pass
+            
+            # Create new status message
+            user_state['status_message'] = await message.reply(f"⏳ **Processing {total_files} file(s)...**", quote=True)
             
             # Process all received files
             processed_count = 0
@@ -346,6 +351,9 @@ async def file_handler(client: Client, message: Message):
                     failed_count += 1
                     logging.error(f"Error processing file: {e}")
             
+            # Clear pending files after processing
+            user_state['pending_files'] = []
+            
             # Get updated batch info
             batch = batches_collection.find_one({"batch_id": batch_id})
             file_count = len(batch.get("file_ids", [])) if batch else 0
@@ -356,7 +364,7 @@ async def file_handler(client: Client, message: Message):
             cancel_button = InlineKeyboardButton("❌ Cancel", callback_data="cancel_batch")
             keyboard = InlineKeyboardMarkup([[get_link_button], [add_more_button], [cancel_button]])
             
-            # Show final menu
+            # Show final menu - only ONE message
             result_text = f"✅ **{processed_count} file(s) processed successfully!**"
             if failed_count > 0:
                 result_text += f"\n❌ **{failed_count} file(s) failed to process**"
@@ -368,21 +376,21 @@ async def file_handler(client: Client, message: Message):
                 reply_markup=keyboard
             )
             
-            # Reset processing state
+            # Reset processing state but keep the status message reference
             user_state['processing'] = False
-            user_state['files_received'] = 0
             
-        else:
-            # If already processing, just update the count
-            user_state['files_received'] += 1
+        # If already processing, the file is already added to pending_files
+        # and will be processed in the next batch
         
     except Exception as e:
         logging.error(f"File handling error: {e}")
         if user_state.get('status_message'):
-            await user_state['status_message'].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+            try:
+                await user_state['status_message'].edit_text(f"❌ **Error!**\n\nSomething went wrong. Please try again.\n`Details: {e}`")
+            except:
+                pass
         # Reset state on error
         user_state['processing'] = False
-        user_state['files_received'] = 0
         user_state['pending_files'] = []
 
 @app.on_callback_query(filters.regex(r"^get_batch_link$"))
@@ -423,6 +431,8 @@ async def add_more_files_callback(client: Client, callback_query: CallbackQuery)
     
     if batch:
         file_count = len(batch.get("file_ids", []))
+        
+        # Update the existing message instead of creating new one
         await callback_query.message.edit_text(
             f"✅ **Ready for more files!**\n\n"
             f"📊 **Current Batch:** {file_count} file(s)\n\n"
